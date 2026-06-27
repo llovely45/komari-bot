@@ -152,7 +152,7 @@ func (a *App) handleCallback(query *tgbotapi.CallbackQuery) error {
 		if err := a.answerCallback(query.ID, "执行提醒检查"); err != nil {
 			return err
 		}
-		sent, err := a.runReminderCheck(true)
+		sent, err := a.runReminderCheck(true, []int64{query.Message.Chat.ID})
 		if err != nil {
 			return a.editUIMessage(query.Message.Chat.ID, query.Message.MessageID, "提醒检查失败："+html.EscapeString(err.Error()), adminMenuMarkup())
 		}
@@ -320,6 +320,9 @@ func (a *App) confirmAddServers(chatID int64, messageID int, userID int64) error
 	}
 
 	text := "已添加服务器：\n- " + strings.Join(names, "\n- ")
+	if _, err := a.runReminderCheck(false, nil); err != nil {
+		log.Printf("post-add reminder check: %v", err)
+	}
 	return a.editUIMessage(chatID, messageID, text, adminMenuMarkup())
 }
 
@@ -391,6 +394,10 @@ func (a *App) showLatencyDetail(chatID int64, messageID int, uuid string, page i
 }
 
 func (a *App) reminderLoop(ctx context.Context) {
+	if _, err := a.runReminderCheck(false, nil); err != nil {
+		log.Printf("startup reminder check: %v", err)
+	}
+
 	for {
 		now := time.Now().In(a.location)
 		next := nextMidnight(now)
@@ -401,14 +408,14 @@ func (a *App) reminderLoop(ctx context.Context) {
 			timer.Stop()
 			return
 		case <-timer.C:
-			if _, err := a.runReminderCheck(false); err != nil {
+			if _, err := a.runReminderCheck(false, nil); err != nil {
 				log.Printf("reminder check: %v", err)
 			}
 		}
 	}
 }
 
-func (a *App) runReminderCheck(force bool) (int, error) {
+func (a *App) runReminderCheck(force bool, targetChats []int64) (int, error) {
 	nodes, err := a.komari.FetchNodes()
 	if err != nil {
 		return 0, err
@@ -434,6 +441,10 @@ func (a *App) runReminderCheck(force bool) (int, error) {
 	now := time.Now().In(a.location)
 	today := now.Format("2006-01-02")
 	sent := 0
+	deliveryChats := targetChats
+	if len(deliveryChats) == 0 {
+		deliveryChats = a.cfg.TelegramNotifyChatIDs
+	}
 
 	for uuid, managed := range managedMap {
 		node, ok := nodeMap[uuid]
@@ -467,7 +478,7 @@ func (a *App) runReminderCheck(force bool) (int, error) {
 
 		text := a.buildReminderText(managed.ServerName, node, expiry, daysRemaining)
 		markup := paidMarkup(uuid, cycleKey)
-		for _, chatID := range a.cfg.TelegramNotifyChatIDs {
+		for _, chatID := range deliveryChats {
 			message := tgbotapi.NewMessage(chatID, text)
 			message.ParseMode = tgbotapi.ModeHTML
 			message.ReplyMarkup = markup
