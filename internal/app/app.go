@@ -50,6 +50,18 @@ type App struct {
 	uiTimers   map[string]*time.Timer
 }
 
+type reminderCandidate struct {
+	ServerUUID    string
+	ServerName    string
+	CycleKey      string
+	Expiry        time.Time
+	DaysRemaining int
+	Ready         bool
+	Reason        string
+	ReminderState store.ReminderState
+	HasState      bool
+}
+
 func New(cfg config.Config, db *store.Store, komariClient *komari.Client, converter *currency.Converter) (*App, error) {
 	bot, err := tgbotapi.NewBotAPI(cfg.TelegramBotToken)
 	if err != nil {
@@ -152,11 +164,14 @@ func (a *App) handleCallback(query *tgbotapi.CallbackQuery) error {
 		if err := a.answerCallback(query.ID, "执行提醒检查"); err != nil {
 			return err
 		}
-		sent, err := a.runReminderCheck(true, []int64{query.Message.Chat.ID})
+		sent, summary, err := a.runReminderCheck(true, []int64{query.Message.Chat.ID})
 		if err != nil {
 			return a.editUIMessage(query.Message.Chat.ID, query.Message.MessageID, "提醒检查失败："+html.EscapeString(err.Error()), adminMenuMarkup())
 		}
 		text := fmt.Sprintf("提醒检查完成，本次发送 %d 条提醒。", sent)
+		if strings.TrimSpace(summary) != "" {
+			text += "\n\n" + summary
+		}
 		return a.editUIMessage(query.Message.Chat.ID, query.Message.MessageID, text, adminMenuMarkup())
 	case data == callbackBackMenu:
 		if err := a.answerCallback(query.ID, "返回菜单"); err != nil {
@@ -320,7 +335,7 @@ func (a *App) confirmAddServers(chatID int64, messageID int, userID int64) error
 	}
 
 	text := "已添加服务器：\n- " + strings.Join(names, "\n- ")
-	if _, err := a.runReminderCheck(false, nil); err != nil {
+	if _, _, err := a.runReminderCheck(false, nil); err != nil {
 		log.Printf("post-add reminder check: %v", err)
 	}
 	return a.editUIMessage(chatID, messageID, text, adminMenuMarkup())
@@ -394,7 +409,7 @@ func (a *App) showLatencyDetail(chatID int64, messageID int, uuid string, page i
 }
 
 func (a *App) reminderLoop(ctx context.Context) {
-	if _, err := a.runReminderCheck(false, nil); err != nil {
+	if _, _, err := a.runReminderCheck(false, nil); err != nil {
 		log.Printf("startup reminder check: %v", err)
 	}
 
@@ -408,22 +423,22 @@ func (a *App) reminderLoop(ctx context.Context) {
 			timer.Stop()
 			return
 		case <-timer.C:
-			if _, err := a.runReminderCheck(false, nil); err != nil {
+			if _, _, err := a.runReminderCheck(false, nil); err != nil {
 				log.Printf("reminder check: %v", err)
 			}
 		}
 	}
 }
 
-func (a *App) runReminderCheck(force bool, targetChats []int64) (int, error) {
+func (a *App) runReminderCheck(force bool, targetChats []int64) (int, string, error) {
 	nodes, err := a.komari.FetchNodes()
 	if err != nil {
-		return 0, err
+		return 0, "", err
 	}
 
 	managedMap, err := a.store.ManagedServerMap()
 	if err != nil {
-		return 0, err
+		return 0, "", err
 	}
 
 	var updates []store.ManagedServer
@@ -435,7 +450,7 @@ func (a *App) runReminderCheck(force bool, targetChats []int64) (int, error) {
 		}
 	}
 	if err := a.store.UpdateManagedServers(updates); err != nil {
-		return 0, err
+		return 0, "", err
 	}
 
 	now := time.Now().In(a.location)
@@ -446,20 +461,94 @@ func (a *App) runReminderCheck(force bool, targetChats []int64) (int, error) {
 		deliveryChats = a.cfg.TelegramNotifyChatIDs
 	}
 
-	for uuid, managed := range managedMap {
+	candidates, err := a.evaluateReminderCandidates(managedMap, nodeMap, now, force, today)
+	if err != nil {
+		return sent, "", err
+	}
+
+	for _, candidate := range candidates {
+		if !candidate.Ready {
+			continue
+		}
+
+		node := nodeMap[candidate.ServerUUID]
+		text := a.buildReminderText(candidate.ServerName, node, candidate.Expiry, candidate.DaysRemaining)
+		markup := paidMarkup(candidate.ServerUUID, candidate.CycleKey)
+		for _, chatID := range deliveryChats {
+			message := tgbotapi.NewMessage(chatID, text)
+			message.ParseMode = tgbotapi.ModeHTML
+			message.ReplyMarkup = markup
+			if _, err := a.bot.Send(message); err != nil {
+				return sent, "", err
+			}
+		}
+
+		state := candidate.ReminderState
+		state.LastNotifiedOn = today
+		if err := a.store.SaveReminderState(state); err != nil {
+			return sent, "", err
+		}
+		sent++
+	}
+
+	return sent, a.buildReminderSummary(candidates, sent), nil
+}
+
+func (a *App) evaluateReminderCandidates(
+	managedMap map[string]store.ManagedServer,
+	nodeMap map[string]komari.Node,
+	now time.Time,
+	force bool,
+	today string,
+) ([]reminderCandidate, error) {
+	candidates := make([]reminderCandidate, 0, len(managedMap))
+
+	serverIDs := make([]string, 0, len(managedMap))
+	for uuid := range managedMap {
+		serverIDs = append(serverIDs, uuid)
+	}
+	sort.Strings(serverIDs)
+
+	for _, uuid := range serverIDs {
+		managed := managedMap[uuid]
+		candidate := reminderCandidate{
+			ServerUUID: managed.ServerUUID,
+			ServerName: managed.ServerName,
+		}
+
 		node, ok := nodeMap[uuid]
 		if !ok {
+			candidate.Reason = "Komari API 未返回该服务器"
+			candidates = append(candidates, candidate)
 			continue
 		}
 
 		expiry, cycleKey, daysRemaining, remindable, err := a.reminderWindow(node, now)
-		if err != nil || !remindable {
+		if err != nil {
+			candidate.Reason = "到期时间解析失败: " + err.Error()
+			candidates = append(candidates, candidate)
+			continue
+		}
+
+		candidate.Expiry = expiry
+		candidate.CycleKey = cycleKey
+		candidate.DaysRemaining = daysRemaining
+
+		if !remindable {
+			if expiry.IsZero() || expiry.Year() <= 1 {
+				candidate.Reason = "未设置到期时间"
+			} else if daysRemaining < 0 {
+				candidate.Reason = fmt.Sprintf("已过期 %d 天", -daysRemaining)
+			} else {
+				candidate.Reason = fmt.Sprintf("剩余 %d 天，未进入 %d 天提醒窗口", daysRemaining, a.cfg.ReminderDays)
+			}
+			candidates = append(candidates, candidate)
 			continue
 		}
 
 		state, exists, err := a.store.GetReminderState(uuid)
 		if err != nil {
-			return sent, err
+			return nil, err
 		}
 		if !exists || state.CycleKey != cycleKey {
 			state = store.ReminderState{
@@ -469,32 +558,46 @@ func (a *App) runReminderCheck(force bool, targetChats []int64) (int, error) {
 				LastNotifiedOn: "",
 			}
 		}
+		candidate.HasState = exists
+		candidate.ReminderState = state
+
 		if state.Acknowledged {
+			candidate.Reason = "已标记为已续费"
+			candidates = append(candidates, candidate)
 			continue
 		}
 		if !force && state.LastNotifiedOn == today {
+			candidate.Reason = "今天已经提醒过"
+			candidates = append(candidates, candidate)
 			continue
 		}
 
-		text := a.buildReminderText(managed.ServerName, node, expiry, daysRemaining)
-		markup := paidMarkup(uuid, cycleKey)
-		for _, chatID := range deliveryChats {
-			message := tgbotapi.NewMessage(chatID, text)
-			message.ParseMode = tgbotapi.ModeHTML
-			message.ReplyMarkup = markup
-			if _, err := a.bot.Send(message); err != nil {
-				return sent, err
-			}
-		}
-
-		state.LastNotifiedOn = today
-		if err := a.store.SaveReminderState(state); err != nil {
-			return sent, err
-		}
-		sent++
+		candidate.Ready = true
+		candidate.Reason = fmt.Sprintf("将发送提醒，剩余 %d 天", daysRemaining)
+		candidates = append(candidates, candidate)
 	}
 
-	return sent, nil
+	return candidates, nil
+}
+
+func (a *App) buildReminderSummary(candidates []reminderCandidate, sent int) string {
+	if len(candidates) == 0 {
+		return "当前没有已添加到 bot 的服务器。"
+	}
+	if sent > 0 {
+		return ""
+	}
+
+	var lines []string
+	lines = append(lines, "未发送提醒，当前状态如下：")
+	for _, candidate := range candidates {
+		line := fmt.Sprintf("• %s: %s", candidate.ServerName, candidate.Reason)
+		if !candidate.Expiry.IsZero() && candidate.Expiry.Year() > 1 {
+			line += fmt.Sprintf("（到期 %s）", candidate.Expiry.In(a.location).Format("2006-01-02 15:04:05"))
+		}
+		lines = append(lines, line)
+	}
+	return strings.Join(lines, "\n")
 }
 
 func (a *App) reminderWindow(node komari.Node, now time.Time) (time.Time, string, int, bool, error) {
