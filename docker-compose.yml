@@ -1,0 +1,9 @@
+services:
+  komari-tg-bot:
+    build: .
+    container_name: komari-tg-bot
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      - ./data:/app/data
