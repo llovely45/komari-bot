@@ -28,7 +28,7 @@ func Load() (Config, error) {
 		KomariKey:        os.Getenv("KOMARI_KEY"),
 		DatabasePath:     defaultString(os.Getenv("DATABASE_PATH"), "./data/komari-bot.db"),
 		Timezone:         defaultString(os.Getenv("TZ"), "Asia/Shanghai"),
-		ReminderDays:     defaultInt(os.Getenv("REMINDER_DAYS"), 5),
+		ReminderDays:     defaultInt(os.Getenv("REMINDER_DAYS"), 10),
 		PingHours:        defaultInt(os.Getenv("PING_HOURS"), 4),
 		FXAPIURL:         defaultString(os.Getenv("FX_API_URL"), "https://api.frankfurter.app/latest"),
 	}
