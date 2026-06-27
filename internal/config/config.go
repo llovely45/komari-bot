@@ -6,7 +6,6 @@ import (
 	"os"
 	"strconv"
 	"strings"
-	"time"
 )
 
 type Config struct {
@@ -19,7 +18,6 @@ type Config struct {
 	Timezone              string
 	ReminderDays          int
 	PingHours             int
-	CheckInterval         time.Duration
 	FXAPIURL              string
 }
 
@@ -34,9 +32,6 @@ func Load() (Config, error) {
 		PingHours:        defaultInt(os.Getenv("PING_HOURS"), 4),
 		FXAPIURL:         defaultString(os.Getenv("FX_API_URL"), "https://api.frankfurter.app/latest"),
 	}
-
-	checkMinutes := defaultInt(os.Getenv("CHECK_INTERVAL_MINUTES"), 60)
-	cfg.CheckInterval = time.Duration(checkMinutes) * time.Minute
 
 	var err error
 	cfg.TelegramAdminIDs, err = parseInt64List(os.Getenv("TELEGRAM_ADMIN_IDS"))
@@ -71,10 +66,6 @@ func Load() (Config, error) {
 	if cfg.PingHours < 1 {
 		return Config{}, errors.New("PING_HOURS must be >= 1")
 	}
-	if cfg.CheckInterval < 5*time.Minute {
-		return Config{}, errors.New("CHECK_INTERVAL_MINUTES must be >= 5")
-	}
-
 	return cfg, nil
 }
 
