@@ -67,6 +67,38 @@ docker compose up -d --build
 docker pull ghcr.io/llovely45/komari-bot:latest
 ```
 
+### 一键下载 `.env` 并启动
+
+先把下面 4 个必填参数换成你自己的值，再直接执行：
+
+```bash
+export TELEGRAM_BOT_TOKEN='123456:replace_me'
+export TELEGRAM_ADMIN_IDS='123456789'
+export KOMARI_URL='https://komari.example.com'
+export KOMARI_KEY='replace_me'
+
+bash <(curl -fsSL https://raw.githubusercontent.com/llovely45/komari-bot/main/scripts/docker-run.sh)
+```
+
+如果提醒要发到单独群组，可以额外加：
+
+```bash
+export TELEGRAM_NOTIFY_CHAT_IDS='-1001234567890'
+```
+
+脚本会自动完成这些动作：
+
+- 下载 `.env.example` 并生成当前目录下的 `.env`
+- 把你传入的环境变量写入 `.env`
+- 拉取 `ghcr.io/llovely45/komari-bot:latest`
+- 删除同名旧容器并重新 `docker run`
+
+启动后查看日志：
+
+```bash
+docker logs -f komari-tg-bot
+```
+
 ```yaml
 services:
   komari-tg-bot:
