@@ -1,4 +1,4 @@
-.env
-data
-bin
-komari-bot
+/.env
+/data
+/bin
+/komari-bot
