@@ -166,6 +166,11 @@ func (s *Store) ManagedServerMap() (map[string]ManagedServer, error) {
 	return result, nil
 }
 
+func (s *Store) DeleteManagedServer(serverUUID string) error {
+	_, err := s.db.Exec(`DELETE FROM managed_servers WHERE server_uuid = ?`, serverUUID)
+	return err
+}
+
 func (s *Store) GetReminderState(serverUUID string) (ReminderState, bool, error) {
 	var state ReminderState
 	err := s.db.QueryRow(`

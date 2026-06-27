@@ -60,6 +60,20 @@ type PingTask struct {
 	DefaultOn bool     `json:"default_on"`
 }
 
+type LoadData struct {
+	Count   int          `json:"count"`
+	Records []LoadRecord `json:"records"`
+}
+
+type LoadRecord struct {
+	Client       string  `json:"client"`
+	Time         string  `json:"time"`
+	NetIn        float64 `json:"net_in"`
+	NetOut       float64 `json:"net_out"`
+	NetTotalUp   float64 `json:"net_total_up"`
+	NetTotalDown float64 `json:"net_total_down"`
+}
+
 func NewClient(baseURL, apiKey string) *Client {
 	return &Client{
 		baseURL: strings.TrimRight(baseURL, "/"),
@@ -85,6 +99,20 @@ func (c *Client) FetchPingData(uuid string, hours int) (PingData, error) {
 	params.Set("hours", fmt.Sprintf("%d", hours))
 	if err := c.getJSON("/api/records/ping", params, &envelope); err != nil {
 		return PingData{}, err
+	}
+	return envelope.Data, nil
+}
+
+func (c *Client) FetchLoadData(uuid string, hours int, loadType string) (LoadData, error) {
+	var envelope responseEnvelope[LoadData]
+	params := url.Values{}
+	params.Set("uuid", uuid)
+	params.Set("hours", fmt.Sprintf("%d", hours))
+	if strings.TrimSpace(loadType) != "" {
+		params.Set("load_type", loadType)
+	}
+	if err := c.getJSON("/api/records/load", params, &envelope); err != nil {
+		return LoadData{}, err
 	}
 	return envelope.Data, nil
 }

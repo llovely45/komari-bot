@@ -21,7 +21,9 @@ import (
 
 const (
 	callbackMenuAdd          = "menu:add"
+	callbackMenuDelete       = "menu:delete"
 	callbackMenuLatency      = "menu:latency"
+	callbackMenuTraffic      = "menu:traffic"
 	callbackMenuReminder     = "menu:reminder"
 	callbackBackMenu         = "nav:menu"
 	callbackNoop             = "nav:noop"
@@ -30,9 +32,16 @@ const (
 	callbackAddConfirm       = "add:confirm"
 	callbackAddTogglePrefix  = "add:toggle:"
 
+	callbackDeletePagePrefix    = "delete:page:"
+	callbackDeleteRefreshPrefix = "delete:refresh:"
+	callbackDeleteRemovePrefix  = "delete:remove:"
+
 	callbackLatencyPagePrefix    = "latency:page:"
 	callbackLatencyRefreshPrefix = "latency:refresh:"
 	callbackLatencyViewPrefix    = "latency:view:"
+
+	callbackTrafficPagePrefix    = "traffic:page:"
+	callbackTrafficRefreshPrefix = "traffic:refresh:"
 
 	pageSize      = 7
 	uiIdleTimeout = 3 * time.Minute
@@ -60,6 +69,17 @@ type reminderCandidate struct {
 	Reason        string
 	ReminderState store.ReminderState
 	HasState      bool
+}
+
+type trafficRankingEntry struct {
+	ServerUUID    string
+	ServerName    string
+	BillingCycle  int
+	UploadBytes   float64
+	DownloadBytes float64
+	TotalBytes    float64
+	HasUsage      bool
+	Note          string
 }
 
 func New(cfg config.Config, db *store.Store, komariClient *komari.Client, converter *currency.Converter) (*App, error) {
@@ -155,11 +175,21 @@ func (a *App) handleCallback(query *tgbotapi.CallbackQuery) error {
 			return err
 		}
 		return a.showAddServerView(query.Message.Chat.ID, query.Message.MessageID, query.From.ID, 1)
+	case data == callbackMenuDelete:
+		if err := a.answerCallback(query.ID, "打开删除列表"); err != nil {
+			return err
+		}
+		return a.showDeleteServerList(query.Message.Chat.ID, query.Message.MessageID, 1)
 	case data == callbackMenuLatency:
 		if err := a.answerCallback(query.ID, "打开延迟监测"); err != nil {
 			return err
 		}
 		return a.showLatencyServerList(query.Message.Chat.ID, query.Message.MessageID, 1)
+	case data == callbackMenuTraffic:
+		if err := a.answerCallback(query.ID, "加载流量排行"); err != nil {
+			return err
+		}
+		return a.showTrafficRanking(query.Message.Chat.ID, query.Message.MessageID, 1)
 	case data == callbackMenuReminder:
 		if err := a.answerCallback(query.ID, "执行提醒检查"); err != nil {
 			return err
@@ -207,6 +237,27 @@ func (a *App) handleCallback(query *tgbotapi.CallbackQuery) error {
 		}
 		a.toggleAddSelection(query.From.ID, uuid)
 		return a.showAddServerView(query.Message.Chat.ID, query.Message.MessageID, query.From.ID, page)
+	case strings.HasPrefix(data, callbackDeletePagePrefix):
+		page := parsePage(data, callbackDeletePagePrefix)
+		if err := a.answerCallback(query.ID, fmt.Sprintf("第 %d 页", page)); err != nil {
+			return err
+		}
+		return a.showDeleteServerList(query.Message.Chat.ID, query.Message.MessageID, page)
+	case strings.HasPrefix(data, callbackDeleteRefreshPrefix):
+		page := parsePage(data, callbackDeleteRefreshPrefix)
+		if err := a.answerCallback(query.ID, "已刷新"); err != nil {
+			return err
+		}
+		return a.showDeleteServerList(query.Message.Chat.ID, query.Message.MessageID, page)
+	case strings.HasPrefix(data, callbackDeleteRemovePrefix):
+		page, uuid, ok := parsePageAndUUID(data, callbackDeleteRemovePrefix)
+		if !ok {
+			return a.answerCallback(query.ID, "按钮数据无效")
+		}
+		if err := a.answerCallback(query.ID, "已删除监听"); err != nil {
+			return err
+		}
+		return a.deleteManagedServer(query.Message.Chat.ID, query.Message.MessageID, uuid, page)
 	case strings.HasPrefix(data, callbackLatencyPagePrefix):
 		page := parsePage(data, callbackLatencyPagePrefix)
 		if err := a.answerCallback(query.ID, fmt.Sprintf("第 %d 页", page)); err != nil {
@@ -228,6 +279,18 @@ func (a *App) handleCallback(query *tgbotapi.CallbackQuery) error {
 			return err
 		}
 		return a.showLatencyDetail(query.Message.Chat.ID, query.Message.MessageID, uuid, page)
+	case strings.HasPrefix(data, callbackTrafficPagePrefix):
+		page := parsePage(data, callbackTrafficPagePrefix)
+		if err := a.answerCallback(query.ID, fmt.Sprintf("第 %d 页", page)); err != nil {
+			return err
+		}
+		return a.showTrafficRanking(query.Message.Chat.ID, query.Message.MessageID, page)
+	case strings.HasPrefix(data, callbackTrafficRefreshPrefix):
+		page := parsePage(data, callbackTrafficRefreshPrefix)
+		if err := a.answerCallback(query.ID, "已刷新"); err != nil {
+			return err
+		}
+		return a.showTrafficRanking(query.Message.Chat.ID, query.Message.MessageID, page)
 	case strings.HasPrefix(data, "paid:"):
 		parts := strings.SplitN(data, ":", 3)
 		if len(parts) != 3 {
@@ -406,6 +469,97 @@ func (a *App) showLatencyDetail(chatID int64, messageID int, uuid string, page i
 	}
 
 	return a.editUIMessage(chatID, messageID, builder.String(), latencyDetailBackMarkup(page))
+}
+
+func (a *App) showDeleteServerList(chatID int64, messageID int, page int) error {
+	servers, err := a.store.ListManagedServers()
+	if err != nil {
+		return err
+	}
+
+	if len(servers) == 0 {
+		return a.editUIMessage(chatID, messageID, "当前没有已监听服务器。", backOnlyMarkup())
+	}
+
+	currentPage, totalPages, items := paginateManagedServers(servers, page)
+	text := fmt.Sprintf(
+		"删除监听服务器\n\n点击服务器后会立刻取消监听、停止提醒并删除该服务器的提醒状态。\n当前第 %d/%d 页，每页最多 %d 台。",
+		currentPage,
+		totalPages,
+		pageSize,
+	)
+
+	return a.editUIMessage(chatID, messageID, text, deleteServerMarkup(items, currentPage, totalPages))
+}
+
+func (a *App) deleteManagedServer(chatID int64, messageID int, uuid string, page int) error {
+	managedMap, err := a.store.ManagedServerMap()
+	if err != nil {
+		return err
+	}
+
+	server, ok := managedMap[uuid]
+	if !ok {
+		return a.showDeleteServerList(chatID, messageID, page)
+	}
+
+	if err := a.store.DeleteManagedServer(uuid); err != nil {
+		return err
+	}
+
+	if err := a.showDeleteServerList(chatID, messageID, page); err != nil {
+		if strings.Contains(err.Error(), "message is not modified") {
+			return a.editUIMessage(chatID, messageID, "已删除监听服务器："+html.EscapeString(server.ServerName), adminMenuMarkup())
+		}
+		return err
+	}
+	return nil
+}
+
+func (a *App) showTrafficRanking(chatID int64, messageID int, page int) error {
+	entries, err := a.collectTrafficRanking()
+	if err != nil {
+		return a.editUIMessage(chatID, messageID, "读取流量排行失败："+html.EscapeString(err.Error()), backOnlyMarkup())
+	}
+
+	if len(entries) == 0 {
+		return a.editUIMessage(chatID, messageID, "还没有已添加服务器，请先在“添加服务器”中选择节点。", backOnlyMarkup())
+	}
+
+	currentPage, totalPages, start, end := pageBounds(len(entries), page)
+	var builder strings.Builder
+	builder.WriteString(fmt.Sprintf(
+		"流量排行\n\n按当前计费周期内总流量从高到低排序。\n当前第 %d/%d 页，每页最多 %d 台。\n",
+		currentPage,
+		totalPages,
+		pageSize,
+	))
+
+	for idx, entry := range entries[start:end] {
+		rank := start + idx + 1
+		builder.WriteString("\n")
+		builder.WriteString(fmt.Sprintf("%d. <b>%s</b>\n", rank, html.EscapeString(entry.ServerName)))
+		if entry.BillingCycle > 0 {
+			builder.WriteString(fmt.Sprintf("计费周期 %d 天\n", entry.BillingCycle))
+		}
+		if entry.HasUsage {
+			builder.WriteString(fmt.Sprintf(
+				"上传 %s | 下载 %s | 总计 %s",
+				formatBytes(entry.UploadBytes),
+				formatBytes(entry.DownloadBytes),
+				formatBytes(entry.TotalBytes),
+			))
+		} else {
+			builder.WriteString("上传 -- | 下载 -- | 总计 --")
+		}
+		if strings.TrimSpace(entry.Note) != "" {
+			builder.WriteString("\n状态：")
+			builder.WriteString(html.EscapeString(entry.Note))
+		}
+		builder.WriteString("\n")
+	}
+
+	return a.editUIMessage(chatID, messageID, builder.String(), trafficRankingMarkup(currentPage, totalPages))
 }
 
 func (a *App) reminderLoop(ctx context.Context) {
@@ -642,12 +796,36 @@ func adminMenuMarkup() *tgbotapi.InlineKeyboardMarkup {
 	markup := tgbotapi.NewInlineKeyboardMarkup(
 		tgbotapi.NewInlineKeyboardRow(
 			tgbotapi.NewInlineKeyboardButtonData("添加服务器", callbackMenuAdd),
+			tgbotapi.NewInlineKeyboardButtonData("删除监听", callbackMenuDelete),
+		),
+		tgbotapi.NewInlineKeyboardRow(
 			tgbotapi.NewInlineKeyboardButtonData("延迟监测", callbackMenuLatency),
+			tgbotapi.NewInlineKeyboardButtonData("流量排行", callbackMenuTraffic),
 		),
 		tgbotapi.NewInlineKeyboardRow(
 			tgbotapi.NewInlineKeyboardButtonData("立即检查提醒", callbackMenuReminder),
 		),
 	)
+	return &markup
+}
+
+func deleteServerMarkup(servers []store.ManagedServer, page int, totalPages int) *tgbotapi.InlineKeyboardMarkup {
+	rows := make([][]tgbotapi.InlineKeyboardButton, 0, len(servers)+4)
+	for _, server := range servers {
+		rows = append(rows, tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData("🗑 "+server.ServerName, fmt.Sprintf("%s%d:%s", callbackDeleteRemovePrefix, page, server.ServerUUID)),
+		))
+	}
+
+	rows = append(rows, paginationRow(page, totalPages, callbackDeletePagePrefix))
+	rows = append(rows, tgbotapi.NewInlineKeyboardRow(
+		tgbotapi.NewInlineKeyboardButtonData("刷新列表", fmt.Sprintf("%s%d", callbackDeleteRefreshPrefix, page)),
+	))
+	rows = append(rows, tgbotapi.NewInlineKeyboardRow(
+		tgbotapi.NewInlineKeyboardButtonData("返回菜单", callbackBackMenu),
+	))
+
+	markup := tgbotapi.NewInlineKeyboardMarkup(rows...)
 	return &markup
 }
 
@@ -704,6 +882,21 @@ func latencyDetailBackMarkup(page int) *tgbotapi.InlineKeyboardMarkup {
 			tgbotapi.NewInlineKeyboardButtonData("返回菜单", callbackBackMenu),
 		),
 	)
+	return &markup
+}
+
+func trafficRankingMarkup(page int, totalPages int) *tgbotapi.InlineKeyboardMarkup {
+	rows := [][]tgbotapi.InlineKeyboardButton{
+		paginationRow(page, totalPages, callbackTrafficPagePrefix),
+		tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData("刷新排行", fmt.Sprintf("%s%d", callbackTrafficRefreshPrefix, page)),
+		),
+		tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData("返回菜单", callbackBackMenu),
+		),
+	}
+
+	markup := tgbotapi.NewInlineKeyboardMarkup(rows...)
 	return &markup
 }
 
@@ -885,6 +1078,90 @@ func paginateManagedServers(servers []store.ManagedServer, page int) (int, int, 
 	return currentPage, totalPages, servers[start:end]
 }
 
+func (a *App) collectTrafficRanking() ([]trafficRankingEntry, error) {
+	servers, err := a.store.ListManagedServers()
+	if err != nil {
+		return nil, err
+	}
+	if len(servers) == 0 {
+		return nil, nil
+	}
+
+	nodes, err := a.komari.FetchNodes()
+	if err != nil {
+		return nil, err
+	}
+
+	nodeMap := make(map[string]komari.Node, len(nodes))
+	var updates []store.ManagedServer
+	for _, node := range nodes {
+		nodeMap[node.UUID] = node
+	}
+	for _, server := range servers {
+		if node, ok := nodeMap[server.ServerUUID]; ok && node.Name != server.ServerName {
+			updates = append(updates, store.ManagedServer{
+				ServerUUID: server.ServerUUID,
+				ServerName: node.Name,
+			})
+		}
+	}
+	if err := a.store.UpdateManagedServers(updates); err != nil {
+		return nil, err
+	}
+
+	entries := make([]trafficRankingEntry, 0, len(servers))
+	for _, server := range servers {
+		entry := trafficRankingEntry{
+			ServerUUID: server.ServerUUID,
+			ServerName: server.ServerName,
+		}
+
+		node, ok := nodeMap[server.ServerUUID]
+		if !ok {
+			entry.Note = "Komari API 未返回该服务器"
+			entries = append(entries, entry)
+			continue
+		}
+		entry.ServerName = node.Name
+		entry.BillingCycle = node.BillingCycle
+
+		if node.BillingCycle <= 0 {
+			entry.Note = "未设置计费周期"
+			entries = append(entries, entry)
+			continue
+		}
+
+		loadData, err := a.komari.FetchLoadData(server.ServerUUID, node.BillingCycle*24, "network")
+		if err != nil {
+			entry.Note = "读取流量数据失败"
+			entries = append(entries, entry)
+			continue
+		}
+
+		upload, download, total, hasUsage := computeTrafficUsage(loadData.Records)
+		entry.UploadBytes = upload
+		entry.DownloadBytes = download
+		entry.TotalBytes = total
+		entry.HasUsage = hasUsage
+		if !hasUsage {
+			entry.Note = "暂无足够的流量样本"
+		}
+		entries = append(entries, entry)
+	}
+
+	sort.Slice(entries, func(i, j int) bool {
+		if entries[i].HasUsage != entries[j].HasUsage {
+			return entries[i].HasUsage
+		}
+		if entries[i].TotalBytes != entries[j].TotalBytes {
+			return entries[i].TotalBytes > entries[j].TotalBytes
+		}
+		return strings.ToLower(entries[i].ServerName) < strings.ToLower(entries[j].ServerName)
+	})
+
+	return entries, nil
+}
+
 func pageBounds(totalItems int, page int) (int, int, int, int) {
 	totalPages := totalItems / pageSize
 	if totalItems%pageSize != 0 {
@@ -973,4 +1250,66 @@ func shortUUID(uuid string) string {
 		return uuid
 	}
 	return uuid[:8]
+}
+
+func computeTrafficUsage(records []komari.LoadRecord) (float64, float64, float64, bool) {
+	if len(records) < 2 {
+		return 0, 0, 0, false
+	}
+
+	sorted := append([]komari.LoadRecord(nil), records...)
+	sort.SliceStable(sorted, func(i, j int) bool {
+		left, leftErr := parseKomariTime(sorted[i].Time)
+		right, rightErr := parseKomariTime(sorted[j].Time)
+		switch {
+		case leftErr == nil && rightErr == nil:
+			return left.Before(right)
+		case leftErr == nil:
+			return true
+		case rightErr == nil:
+			return false
+		default:
+			return sorted[i].Time < sorted[j].Time
+		}
+	})
+
+	var upload float64
+	var download float64
+	for i := 1; i < len(sorted); i++ {
+		upDelta := sorted[i].NetTotalUp - sorted[i-1].NetTotalUp
+		downDelta := sorted[i].NetTotalDown - sorted[i-1].NetTotalDown
+
+		if upDelta >= 0 {
+			upload += upDelta
+		} else if sorted[i].NetTotalUp > 0 {
+			upload += sorted[i].NetTotalUp
+		}
+
+		if downDelta >= 0 {
+			download += downDelta
+		} else if sorted[i].NetTotalDown > 0 {
+			download += sorted[i].NetTotalDown
+		}
+	}
+
+	total := upload + download
+	if total <= 0 {
+		return upload, download, total, false
+	}
+	return upload, download, total, true
+}
+
+func formatBytes(value float64) string {
+	units := []string{"B", "KB", "MB", "GB", "TB", "PB"}
+	size := value
+	unitIndex := 0
+	for size >= 1024 && unitIndex < len(units)-1 {
+		size /= 1024
+		unitIndex++
+	}
+
+	if unitIndex == 0 {
+		return fmt.Sprintf("%.0f %s", size, units[unitIndex])
+	}
+	return fmt.Sprintf("%.2f %s", size, units[unitIndex])
 }
